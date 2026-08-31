@@ -157,6 +157,25 @@ void setPreset(float angle)
 
 void processCommand(const char *command)
 {
+  // G<joint>,<angle>  — dat goc truc tiep cho mot khop (tu slider GUI)
+  if (command[0] == 'G')
+  {
+    const char *comma = strchr(command + 1, ',');
+    if (comma != nullptr)
+    {
+      const uint8_t joint = (uint8_t)atoi(command + 1);
+      const float angle   = (float)atof(comma + 1);
+      if (joint < JOINT_COUNT)
+      {
+        heldKeys &= ~(1u << (joint * 2)) & ~(1u << (joint * 2 + 1)); // giai phong phim khop do
+        targetAngles[joint] = constrain(angle, 0.0f, 180.0f);
+        targetActive[joint] = true;
+        lastCommandTime = millis();
+      }
+    }
+    return;
+  }
+
   if (command[0] == 'K')
   {
     uint16_t newHeldKeys = 0;
