@@ -1,4 +1,4 @@
- """Dieu khien tay may bang slider keo goc — GUI Python (Tkinter).
+"""Dieu khien tay may bang slider keo goc — GUI Python (Tkinter).
 
 Moi slider tuong ung voi mot khop servo. Keo slider den goc mong muon,
 Arduino se di chuyen servo den dung goc do (co gia toc / phanh mem).
@@ -26,11 +26,17 @@ from serial.tools import list_ports
 
 BAUD_RATE = 115200
 POLL_MS = 50          # Tan suat cap nhat UI (ms)
+ARRIVAL_TOLERANCE_DEG = 2.0
+ARRIVAL_STABLE_SAMPLES = 3
+MOVE_TIMEOUT_S = 20.0
+GRIP_SETTLE_S = 0.8
+HAND_INDEX = 0
+ARM_JOINTS = (1, 2, 3, 4)
 
 # Ten va thong so tung khop (phai khop voi thu tu trong firmware)
 # (ten, min_deg, max_deg, initial_deg)
 JOINTS = [
-    ("Hand",     0, 180, 150),
+    ("Hand",     100, 160, 150),
     ("Wrist",    0, 180,  90),
     ("Elbow",    0, 180, 180),
     ("Shoulder", 0, 180,   0),
@@ -232,6 +238,23 @@ class SliderController:
         self.closed = False
         self.receive_buffer = ""
         self._pending = {}
+        self.actual_angles = [None] * len(JOINTS)
+
+        # A va B la hai diem lam viec. SAFE la tu the trung chuyen tren cao;
+        # mac dinh dung tu the khoi dong va co the day lai tren giao dien.
+        self.points = {
+            "A": None,
+            "B": None,
+            "SAFE": {i: float(JOINTS[i][3]) for i in ARM_JOINTS},
+        }
+        self.grip_open_angle = None
+        self.grip_close_angle = None
+        self.auto_steps = []
+        self.auto_step_index = -1
+        self.auto_target = None
+        self.auto_deadline = 0.0
+        self.auto_wait_until = 0.0
+        self.auto_stable_samples = 0
 
         self.serial = serial.Serial(port, BAUD_RATE, timeout=0, write_timeout=0.1)
 
@@ -276,6 +299,68 @@ class SliderController:
                 relief="flat", padx=10, pady=5, cursor="hand2",
             ).pack(side="left", padx=6)
 
+        teach_frame = tk.LabelFrame(
+            root, text="  DAY DIEM A/B VA KEP  ",
+            font=("Segoe UI", 10, "bold"),
+            bg=BG_COLOR, fg=TEXT_COLOR, padx=10, pady=8,
+        )
+        teach_frame.pack(fill="x", padx=20, pady=(8, 4))
+
+        point_buttons = tk.Frame(teach_frame, bg=BG_COLOR)
+        point_buttons.pack()
+        for text, point in [
+            ("Luu diem A", "A"),
+            ("Luu diem B", "B"),
+            ("Luu diem SAFE", "SAFE"),
+        ]:
+            tk.Button(
+                point_buttons, text=text,
+                command=lambda p=point: self._capture_point(p),
+                font=("Segoe UI", 9), bg="#313244", fg=TEXT_COLOR,
+                activebackground=ACCENT_COLOR, activeforeground="#ffffff",
+                relief="flat", padx=8, pady=4, cursor="hand2",
+            ).pack(side="left", padx=4)
+
+        grip_buttons = tk.Frame(teach_frame, bg=BG_COLOR)
+        grip_buttons.pack(pady=(7, 0))
+        tk.Button(
+            grip_buttons, text="Luu goc MO kep",
+            command=lambda: self._capture_grip(True),
+            font=("Segoe UI", 9), bg="#313244", fg=TEXT_COLOR,
+            activebackground=ACCENT_COLOR, activeforeground="#ffffff",
+            relief="flat", padx=8, pady=4, cursor="hand2",
+        ).pack(side="left", padx=4)
+        tk.Button(
+            grip_buttons, text="Luu goc DONG kep",
+            command=lambda: self._capture_grip(False),
+            font=("Segoe UI", 9), bg="#313244", fg=TEXT_COLOR,
+            activebackground=ACCENT_COLOR, activeforeground="#ffffff",
+            relief="flat", padx=8, pady=4, cursor="hand2",
+        ).pack(side="left", padx=4)
+
+        self.teach_status_label = tk.Label(
+            teach_frame,
+            text="A: chua luu | B: chua luu | SAFE: mac dinh | Mo/Đong kep: chua luu",
+            font=("Segoe UI", 9), bg=BG_COLOR, fg=LABEL_COLOR,
+        )
+        self.teach_status_label.pack(pady=(8, 0))
+
+        auto_frame = tk.Frame(root, bg=BG_COLOR)
+        auto_frame.pack(pady=(7, 1))
+        self.run_button = tk.Button(
+            auto_frame, text="  CHAY A  ->  B  ", command=self._run_a_to_b,
+            font=("Segoe UI", 10, "bold"), bg="#2f8f56", fg="#ffffff",
+            activebackground="#40a96b", activeforeground="#ffffff",
+            relief="flat", padx=12, pady=6, cursor="hand2",
+        )
+        self.run_button.pack(side="left", padx=6)
+        tk.Button(
+            auto_frame, text="  DUNG KHAN CAP  ", command=self._emergency_stop,
+            font=("Segoe UI", 10, "bold"), bg="#b00020", fg="#ffffff",
+            activebackground="#d02040", activeforeground="#ffffff",
+            relief="flat", padx=12, pady=6, cursor="hand2",
+        ).pack(side="left", padx=6)
+
         self.status_label = tk.Label(
             root,
             text=f"\u2714  Ket noi  {port}  @  {BAUD_RATE} baud",
@@ -288,6 +373,8 @@ class SliderController:
         root.after(POLL_MS, self._tick)
 
     def _slider_changed(self, joint, angle):
+        if self.auto_steps:
+            self._stop_automation("Da dung tu dong de dieu khien thu cong.")
         self._pending[joint] = angle
 
     def _send_angle(self, joint, angle):
@@ -295,14 +382,165 @@ class SliderController:
             self.serial.write(f"G{joint},{angle:.1f}\n".encode("ascii"))
 
     def _go_preset(self, angle):
+        if self.auto_steps:
+            self._stop_automation("Da dung tu dong.")
         for i, s in enumerate(self.sliders):
-            s.set_value(float(angle))
-            self._pending[i] = float(angle)
+            safe_angle = max(s.min_deg, min(s.max_deg, float(angle)))
+            s.set_value(safe_angle)
+            self._pending[i] = safe_angle
 
     def _go_initial(self):
+        if self.auto_steps:
+            self._stop_automation("Da dung tu dong.")
         for i, (_, _, _, init) in enumerate(JOINTS):
             self.sliders[i].set_value(float(init))
             self._pending[i] = float(init)
+
+    def _capture_point(self, name):
+        if self.auto_steps:
+            messagebox.showwarning("Dang chay", "Hay dung chu trinh truoc khi day diem.")
+            return
+        self.points[name] = {i: self.sliders[i].get_value() for i in ARM_JOINTS}
+        self._update_teach_status()
+        self.status_label.config(text=f"Da luu diem {name}.", fg=STATUS_OK_COLOR)
+
+    def _capture_grip(self, is_open):
+        if self.auto_steps:
+            messagebox.showwarning("Dang chay", "Hay dung chu trinh truoc khi day kep.")
+            return
+        angle = self.sliders[HAND_INDEX].get_value()
+        if is_open:
+            self.grip_open_angle = angle
+            text = "MO"
+        else:
+            self.grip_close_angle = angle
+            text = "DONG"
+        self._update_teach_status()
+        self.status_label.config(
+            text=f"Da luu goc {text} kep: {angle:.0f} do.", fg=STATUS_OK_COLOR
+        )
+
+    def _update_teach_status(self):
+        a = "da luu" if self.points["A"] else "chua luu"
+        b = "da luu" if self.points["B"] else "chua luu"
+        safe = "da luu" if self.points["SAFE"] else "chua luu"
+        opened = ("chua luu" if self.grip_open_angle is None
+                  else f"{self.grip_open_angle:.0f} deg")
+        closed = ("chua luu" if self.grip_close_angle is None
+                  else f"{self.grip_close_angle:.0f} deg")
+        self.teach_status_label.config(
+            text=f"A: {a} | B: {b} | SAFE: {safe} | Mo: {opened} | Dong: {closed}"
+        )
+
+    def _run_a_to_b(self):
+        missing = []
+        if self.points["A"] is None:
+            missing.append("diem A")
+        if self.points["B"] is None:
+            missing.append("diem B")
+        if self.grip_open_angle is None:
+            missing.append("goc MO kep")
+        if self.grip_close_angle is None:
+            missing.append("goc DONG kep")
+        if missing:
+            messagebox.showwarning(
+                "Chua day du",
+                "Can luu: " + ", ".join(missing) + ".",
+            )
+            return
+        if any(angle is None for angle in self.actual_angles):
+            messagebox.showwarning(
+                "Chua co phan hoi", "Chua nhan duoc trang thai goc tu Arduino."
+            )
+            return
+
+        self._pending.clear()
+        self._send_line("X")
+        self.auto_steps = [
+            ("Mo kep", {HAND_INDEX: self.grip_open_angle}, GRIP_SETTLE_S),
+            ("Ve diem an toan", self.points["SAFE"], 0.0),
+            ("Di den A", self.points["A"], 0.0),
+            ("Kep vat tai A", {HAND_INDEX: self.grip_close_angle}, GRIP_SETTLE_S),
+            ("Nang ve diem an toan", self.points["SAFE"], 0.0),
+            ("Di den B", self.points["B"], 0.0),
+            ("Tha vat tai B", {HAND_INDEX: self.grip_open_angle}, GRIP_SETTLE_S),
+            ("Roi ve diem an toan", self.points["SAFE"], 0.0),
+        ]
+        self.auto_step_index = -1
+        self.run_button.config(state="disabled")
+        self._start_next_auto_step()
+
+    def _send_line(self, message):
+        if not self.closed:
+            self.serial.write((message + "\n").encode("ascii"))
+
+    def _start_next_auto_step(self):
+        self.auto_step_index += 1
+        if self.auto_step_index >= len(self.auto_steps):
+            self.auto_steps = []
+            self.auto_target = None
+            self.run_button.config(state="normal")
+            self.status_label.config(
+                text="Hoan thanh chu trinh gap A -> B.", fg=STATUS_OK_COLOR
+            )
+            return
+
+        name, target, _settle = self.auto_steps[self.auto_step_index]
+        self.auto_target = dict(target)
+        self.auto_deadline = time.monotonic() + MOVE_TIMEOUT_S
+        self.auto_wait_until = 0.0
+        self.auto_stable_samples = 0
+        for joint, angle in self.auto_target.items():
+            self.sliders[joint].set_value(angle)
+            self._pending[joint] = angle
+        self.status_label.config(
+            text=f"Tu dong {self.auto_step_index + 1}/{len(self.auto_steps)}: {name}",
+            fg=VALUE_COLOR,
+        )
+
+    def _update_automation(self):
+        if not self.auto_steps:
+            return
+        now = time.monotonic()
+        if self.auto_wait_until:
+            if now >= self.auto_wait_until:
+                self._start_next_auto_step()
+            return
+        if now > self.auto_deadline:
+            name = self.auto_steps[self.auto_step_index][0]
+            self._stop_automation(f"Timeout khi: {name}", emergency=True)
+            messagebox.showerror(
+                "Robot khong toi dich",
+                f"Robot khong toi dich trong {MOVE_TIMEOUT_S:.0f} giay. Da dung khan cap.",
+            )
+            return
+        arrived = all(
+            self.actual_angles[joint] is not None
+            and abs(self.actual_angles[joint] - angle) <= ARRIVAL_TOLERANCE_DEG
+            for joint, angle in self.auto_target.items()
+        )
+        self.auto_stable_samples = self.auto_stable_samples + 1 if arrived else 0
+        if self.auto_stable_samples >= ARRIVAL_STABLE_SAMPLES:
+            _name, _target, settle = self.auto_steps[self.auto_step_index]
+            if settle > 0:
+                self.auto_target = None
+                self.auto_wait_until = now + settle
+            else:
+                self._start_next_auto_step()
+
+    def _stop_automation(self, reason, emergency=True):
+        self.auto_steps = []
+        self.auto_target = None
+        self.auto_wait_until = 0.0
+        self.auto_stable_samples = 0
+        self._pending.clear()
+        if emergency:
+            self._send_line("X")
+        self.run_button.config(state="normal")
+        self.status_label.config(text=reason, fg=STATUS_ERR_COLOR)
+
+    def _emergency_stop(self):
+        self._stop_automation("DA DUNG KHAN CAP.", emergency=True)
 
     def _tick(self):
         if self.closed:
@@ -312,7 +550,11 @@ class SliderController:
                 self._send_angle(joint, angle)
                 del self._pending[joint]
             self._read_status()
+            self._update_automation()
         except (serial.SerialException, serial.SerialTimeoutException) as err:
+            self.auto_steps = []
+            self.auto_target = None
+            self.run_button.config(state="normal")
             self.status_label.config(text=f"\u2716  Loi: {err}", fg=STATUS_ERR_COLOR)
         self.root.after(POLL_MS, self._tick)
 
@@ -330,7 +572,9 @@ class SliderController:
             if len(fields) == len(self.sliders):
                 for slider, field in zip(self.sliders, fields):
                     try:
-                        slider.set_feedback(float(field))
+                        angle = float(field)
+                        slider.set_feedback(angle)
+                        self.actual_angles[slider.joint_index] = angle
                     except ValueError:
                         pass
 
@@ -339,6 +583,8 @@ class SliderController:
             return
         self.closed = True
         try:
+            self.serial.write(b"X\n")
+            time.sleep(0.05)
             self.serial.close()
         finally:
             self.root.destroy()

@@ -211,6 +211,17 @@ void processCommand(const char *command)
     targetAngles[HAND] = 0.0f;
     targetActive[HAND] = true;
   }
+  else if (command[0] == 'X' && command[1] == '\0')
+  {
+    // Dung ngay moi chuyen dong tu ban phim va cac dich goc dang chay.
+    heldKeys = 0;
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i)
+    {
+      targetActive[i] = false;
+      jointVelocities[i] = 0.0f;
+    }
+    printAngles();
+  }
   else if (command[0] == 'V' && command[1] >= '1' && command[1] <= '4' && command[2] == '\0')
   {
     const uint8_t newLevel = command[1] - '0';
