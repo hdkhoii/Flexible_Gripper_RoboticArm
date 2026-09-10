@@ -36,8 +36,7 @@ Mở kẹp -> SAFE -> A -> đóng kẹp -> SAFE -> B -> mở kẹp -> SAFE
 
 Chương trình chỉ chuyển bước sau khi tất cả khớp liên quan đã nằm trong sai số
 2 độ qua ba lần phản hồi liên tiếp. Nếu một bước kéo dài quá 20 giây, robot sẽ
-dừng. Nút **DỪNG KHẨN CẤP** gửi lệnh `X` để hủy cả điều khiển bàn phím lẫn các
-góc đích đang chạy.
+dừng. Nút **DỪNG KHẨN CẤP** gửi lệnh `X` để hủy các góc đích đang chạy.
 
 Các điểm chỉ được lưu trong phiên chạy hiện tại. Khi đóng chương trình, cần dạy
 lại A, B và hai góc kẹp ở lần mở sau.
